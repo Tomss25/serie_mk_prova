@@ -1,86 +1,71 @@
-import pandas as pd
-import numpy as np
-import yfinance as yf
-import mstarpy
-from scipy.optimize import minimize
-from sklearn.covariance import LedoitWolf
-import streamlit as st
+import itertools
 
-# --- DATA FETCHING (Cachata per non bruciare le API) ---
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_yahoo(ticker, start_dt):
-    try:
-        df = yf.download(ticker, start=start_dt, progress=False)
-        if not df.empty:
-            col = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
-            return df[col].squeeze().dropna()
-    except Exception as e:
-        print(f"YF Error on {ticker}: {e}")
-    return None
+# --- MATEMATICA 3-TIER MODEL (Combinatoria) ---
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_morningstar(isin, start_dt, end_dt):
-    try:
-        fund = mstarpy.Funds(term=isin, country="it")
-        history = fund.nav(start_date=start_dt, end_date=end_dt, frequency="daily")
-        if history:
-            df = pd.DataFrame(history)
-            df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None)
-            return df.set_index('date')['nav'].dropna()
-    except Exception as e:
-        print(f"MStar Error on {isin}: {e}")
-    return None
+def get_advanced_stats(weights, returns, annual_factor):
+    weights = np.array(weights)
+    port_series = returns.dot(weights)
+    
+    mean_ret = port_series.mean() * annual_factor
+    volatility = port_series.std() * np.sqrt(annual_factor)
+    sharpe = mean_ret / volatility if volatility != 0 else 0
+    
+    negative_returns = port_series[port_series < 0]
+    downside_std = negative_returns.std() * np.sqrt(annual_factor)
+    sortino = mean_ret / downside_std if downside_std != 0 else 0
+    
+    cumulative = (1 + port_series).cumprod()
+    peak = cumulative.cummax()
+    max_drawdown = ((cumulative - peak) / peak).min()
+    
+    return mean_ret, volatility, sharpe, sortino, max_drawdown
 
-def align_and_clean_data(series_dict):
-    """Allinea le serie evitando corruzione da ffill infinito."""
-    df = pd.DataFrame(series_dict)
-    # Limita il forward fill a max 3 giorni (es. weekend/feste locali)
-    df = df.ffill(limit=3).dropna(how='any')
-    return df
+def get_avg_correlation(data, assets):
+    if len(assets) < 2: return 1.0
+    corr_matrix = data[list(assets)].corr()
+    values = corr_matrix.values[np.triu_indices_from(corr_matrix, k=1)]
+    return values.mean()
 
-# --- MATH OPTIMIZATION ---
-def get_optimal_weights(mu, sigma, min_weight, max_weight, rf):
-    num_assets = len(mu)
-    actual_max_weight = max(max_weight, 1.0 / num_assets + 0.01)
-    args = (mu, sigma, rf)
+def optimize_subset_portfolio(returns, annual_factor, min_weight=0.0):
+    n_assets = len(returns.columns)
+    if n_assets * min_weight > 1.0: return None 
+        
+    def objective(w):
+        ret = np.sum(returns.mean() * w) * annual_factor
+        vol = np.sqrt(np.dot(w.T, np.dot(returns.cov() * annual_factor, w)))
+        return -(ret / vol) if vol > 0 else 0
+
     constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
-    bounds = tuple((min_weight, actual_max_weight) for _ in range(num_assets))
+    bounds = tuple((min_weight, 1) for _ in range(n_assets))
+    init_guess = [1./n_assets for _ in range(n_assets)]
     
-    def neg_sharpe(w, mu, sigma, rf):
-        ret = np.sum(mu * w)
-        vol = np.sqrt(np.dot(w.T, np.dot(sigma, w)))
-        return -(ret - rf) / vol if vol > 0 else 1e6
+    try:
+        result = minimize(objective, init_guess, method='SLSQP', bounds=bounds, constraints=constraints)
+        return result.x if result.success else None
+    except: 
+        return None
 
-    res = minimize(neg_sharpe, [1./num_assets]*num_assets, args=args, bounds=bounds, constraints=constraints, method='SLSQP')
-    return res.x if res.success else None
-
-def get_cvar_weights(returns_matrix, min_weight, max_weight, alpha=0.05):
-    num_scenarios, num_assets = returns_matrix.shape
-    actual_max_weight = max(max_weight, 1.0 / num_assets + 0.01)
+@st.cache_data(show_spinner=False)
+def find_best_optimized_combination(df_returns, k, annual_factor, max_corr_threshold=1.0, min_w=0.0):
+    assets = df_returns.columns.tolist()
+    if len(assets) < k or k * min_w > 1.0: 
+        return None, None, (0,0,0,0,0)
     
-    def cvar_objective(params):
-        w, gamma = params[:-1], params[-1]
-        shortfall = np.maximum(-np.dot(returns_matrix, w) - gamma, 0)
-        return gamma + np.sum(shortfall) / (alpha * num_scenarios)
+    best_sharpe = -np.inf
+    best_combo, best_weights, best_full_stats = None, None, None
 
-    initial_w = [1./num_assets] * num_assets
-    initial_gamma = -np.percentile(np.dot(returns_matrix, initial_w), alpha * 100)
-    
-    bounds = tuple((min_weight, actual_max_weight) for _ in range(num_assets)) + ((None, None),)
-    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x[:-1]) - 1})
-
-    res = minimize(cvar_objective, np.append(initial_w, initial_gamma), method='SLSQP', bounds=bounds, constraints=constraints)
-    return res.x[:-1] if res.success else None
-
-def bootstrap_projection(returns_df, weights, years, num_sims=5000):
-    """Sostituisce il Moto Browniano irreale. Usa il campionamento con re-immissione."""
-    port_returns = np.dot(returns_df.values, weights)
-    days = int(252 * years)
-    # Campiona direttamente dai veri rendimenti giornalieri passati (code grasse incluse)
-    simulated_returns = np.random.choice(port_returns, size=(days, num_sims), replace=True)
-    
-    sim_matrix = np.zeros((days + 1, num_sims))
-    sim_matrix[0] = 100.0
-    sim_matrix[1:] = 100.0 * np.cumprod(1 + simulated_returns, axis=0)
-    
-    return np.percentile(sim_matrix, [5, 25, 50, 75, 95], axis=1)
+    for combo in itertools.combinations(assets, k):
+        current_corr = get_avg_correlation(df_returns, combo)
+        if current_corr <= max_corr_threshold:
+            subset = df_returns[list(combo)]
+            weights = optimize_subset_portfolio(subset, annual_factor, min_weight=min_w)
+            
+            if weights is not None:
+                r, v, s, sort, mdd = get_advanced_stats(weights, subset, annual_factor)
+                if s > best_sharpe:
+                    best_sharpe = s
+                    best_combo = combo
+                    best_weights = weights
+                    best_full_stats = (r, v, s, sort, mdd)
+            
+    return best_combo, best_weights, best_full_stats
